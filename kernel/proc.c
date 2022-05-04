@@ -127,6 +127,8 @@ found:
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
+  p->syscall_trace = 0; // (newly added) 为 syscall_trace 设置一个 0 的默认值
+
   return p;
 }
 
@@ -294,6 +296,8 @@ fork(void)
   pid = np->pid;
 
   np->state = RUNNABLE;
+
+  np->syscall_trace = p->syscall_trace; // (newly added) 子进程继承父进程的 syscall_trace
 
   release(&np->lock);
 
@@ -692,4 +696,19 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+// Counting used process slots (lab2)
+uint64
+count_proc(void)
+{
+  uint64 proc_nums = 0;
+  struct proc *p;
+
+  for(p = proc; p < &proc[NPROC]; p++) {
+    if (p->state != UNUSED)
+      proc_nums++;
+  }
+
+  return proc_nums;
 }
