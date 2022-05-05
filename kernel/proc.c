@@ -26,11 +26,12 @@ void
 procinit(void)
 {
   struct proc *p;
-  
+
   initlock(&pid_lock, "nextpid");
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
 
+      /* 这里删除了为所有进程预分配内核栈的代码，变为创建进程的时候再创建内核栈，见 allocproc()
       // Allocate a page for the process's kernel stack.
       // Map it high in memory, followed by an invalid
       // guard page.
@@ -40,6 +41,7 @@ procinit(void)
       uint64 va = KSTACK((int) (p - proc));
       kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
       p->kstack = va;
+      */
   }
   kvminithart();
 }
@@ -121,6 +123,23 @@ found:
     return 0;
   }
 
+////// 新加部分 start //////
+
+  // 为新进程创建独立的内核页表，并将内核所需要的各种映射添加到新页表上
+  p->kernal_pgtbl = proc_kvminit();
+  // printf("kernel_pagetable: %p\n", p->kernelpgtbl);
+
+  // 分配一个物理页，作为新进程的内核栈使用
+  char *pa = kalloc();
+  if(pa == 0)
+    panic("kalloc");
+  uint64 va = KSTACK((int)0); // 将内核栈映射到固定的逻辑地址上
+  // printf("map krnlstack va: %p to pa: %p\n", va, pa);
+  proc_kvmmap(p->kernal_pgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  p->kstack = va; // 记录内核栈的逻辑地址，其实已经是固定的了，依然这样记录是为了避免需要修改其他部分 xv6 代码
+
+////// 新加部分 end //////
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -149,6 +168,16 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+
+  // 释放进程的内核栈
+  void *kstack_pa = (void *)proc_kvmpa(p->kernal_pgtbl, p->kstack);
+  kfree(kstack_pa);
+  p->kstack = 0;
+
+  // 递归释放进程独享的页表，释放页表本身所占用的空间，但**不释放页表指向的物理页**
+  proc_freewalk(p->kernal_pgtbl);
+  p->kernal_pgtbl = 0;
+
   p->state = UNUSED;
 }
 
@@ -220,6 +249,7 @@ userinit(void)
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
+  kvmcopymappings(p->pagetable, p->kernal_pgtbl, 0, p->sz); // 同步程序内存映射到进程内核页表中
 
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
@@ -243,11 +273,20 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
-    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+    uint64 newsz;
+    if((newsz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
-  } else if(n < 0){
+    // 内核页表中的映射同步扩大
+    if(kvmcopymappings(p->pagetable, p->kernal_pgtbl, sz, n) != 0) {
+      uvmdealloc(p->pagetable, newsz, sz);
+      return -1;
+    }
+    sz = newsz;
+  } else if (n < 0) {
     sz = uvmdealloc(p->pagetable, sz, sz + n);
+    // 内核页表中的映射同步缩小
+    sz = kvmdealloc(p->kernal_pgtbl, sz, sz + n);
   }
   p->sz = sz;
   return 0;
@@ -268,7 +307,9 @@ fork(void)
   }
 
   // Copy user memory from parent to child.
-  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+  // 调用 kvmcopymappings，将**新进程**用户页表映射拷贝一份到新进程内核页表中
+  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0 ||
+     kvmcopymappings(np->pagetable, np->kernal_pgtbl, 0, p->sz) < 0){
     freeproc(np);
     release(&np->lock);
     return -1;
@@ -473,7 +514,14 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        // 切换到进程独立的内核页表
+        w_satp(MAKE_SATP(p->kernal_pgtbl));
+        sfence_vma(); // 清除快表缓存
+        // 调度，执行进程
         swtch(&c->context, &p->context);
+        // 切换回全局内核页表
+        kvminithart();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
